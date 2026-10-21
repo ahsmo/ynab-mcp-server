@@ -63,7 +63,10 @@ async def main() -> None:
 
         result = await client.call_tool("deleteTransaction", {"plan_id": "plan-1", "transaction_id": "t1"})
         assert not result.is_error
-        assert [(r.method, r.url.path) for r in sent] == [("DELETE", "/v1/plans/plan-1/transactions/t1")]
+        assert [(r.method, r.url.path) for r in sent] == [
+            ("DELETE", "/v1/plans/plan-1/transactions/t1"),
+            ("GET", "/v1/plans/plan-1/transactions/t1"),  # VerifyDeletes re-fetch
+        ]
 
 
 asyncio.run(main())

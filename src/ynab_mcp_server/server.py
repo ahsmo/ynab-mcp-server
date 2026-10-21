@@ -1,6 +1,7 @@
 """YNAB MCP Server using FastMCP and OpenAPI specification."""
 
 import os
+from urllib.parse import quote
 
 import httpx
 import yaml
@@ -58,6 +59,55 @@ class RequirePathParams(Middleware):
         return await call_next(context)
 
 
+class VerifyDeletes(Middleware):
+    """Re-fetch a record after deleting it, and fail if YNAB did not actually delete it.
+
+    YNAB sometimes answers a DELETE with HTTP 200 and "deleted": true without applying
+    it: server_knowledge does not change and the record is still returned afterwards.
+    """
+
+    def __init__(self, client: httpx.AsyncClient, delete_paths: dict[str, str]) -> None:
+        self.client = client
+        self.delete_paths = delete_paths
+
+    async def on_call_tool(self, context: MiddlewareContext, call_next):
+        result = await call_next(context)
+        path_template = self.delete_paths.get(context.message.name)
+        if path_template is None:
+            return result
+
+        arguments = context.message.arguments or {}
+        path = path_template.format_map(
+            {name: quote(str(value), safe="") for name, value in arguments.items()}
+        )
+        try:
+            response = await self.client.get(path)
+        except httpx.HTTPError as e:
+            raise ToolError(
+                f"YNAB accepted the delete, but checking that it applied failed "
+                f"({type(e).__name__}). Fetch the record to confirm it is gone."
+            ) from e
+        if response.status_code == 404:
+            return result
+        if response.status_code != 200:
+            raise ToolError(
+                f"YNAB accepted the delete, but checking that it applied returned "
+                f"HTTP {response.status_code}. Fetch the record to confirm it is gone."
+            )
+        records = [
+            value
+            for value in response.json().get("data", {}).values()
+            if isinstance(value, dict) and "deleted" in value
+        ]
+        if records and records[0]["deleted"] is False:
+            raise ToolError(
+                f"YNAB returned success for {context.message.name} but did not delete the "
+                f"record: it is still present with deleted=false. Delete it in the YNAB app "
+                f"instead."
+            )
+        return result
+
+
 def create_server() -> FastMCP:
     """Create and configure the YNAB MCP server from the OpenAPI spec."""
     token = os.environ.get("YNAB_API_TOKEN")
@@ -80,6 +130,7 @@ def create_server() -> FastMCP:
     )
 
     path_params: dict[str, list[str]] = {}
+    delete_paths: dict[str, str] = {}
 
     def customize_component(route: HTTPRoute, component: object) -> None:
         if not isinstance(component, OpenAPITool):
@@ -90,6 +141,8 @@ def create_server() -> FastMCP:
         path_params[component.name] = [
             param.name for param in route.parameters if param.location == "path"
         ]
+        if route.method.upper() == "DELETE":
+            delete_paths[component.name] = route.path
 
     # Create MCP server from OpenAPI spec
     server = FastMCP.from_openapi(
@@ -100,6 +153,7 @@ def create_server() -> FastMCP:
         mcp_component_fn=customize_component,
     )
     server.add_middleware(RequirePathParams(path_params))
+    server.add_middleware(VerifyDeletes(client, delete_paths))
     return server
 
 
